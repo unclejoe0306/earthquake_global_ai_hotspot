@@ -1,0 +1,1 @@
+# earthquake_global_ai_hotspot
