@@ -1,0 +1,135 @@
+name: 同步全球地震每日日報
+
+on:
+  schedule:
+    # UTC 00:00 = 台灣時間每天上午 08:00
+    - cron: "0 0 * * *"
+
+  # 可在 Actions 頁面手動執行
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-daily-report
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      SOURCE_URL: https://global-seismic-fractal-analysis-dailyreport.unclejoe0306.chatgpt.site/
+      TARGET_BRANCH: ${{ github.event.repository.default_branch }}
+
+    steps:
+      - name: 取得儲存庫
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          token: ${{ secrets.PAGES_SYNC_TOKEN }}
+          fetch-depth: 1
+
+      - name: 下載最新首頁
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # 先下載至暫存檔，成功後才覆蓋原首頁
+          curl \
+            --fail \
+            --location \
+            --retry 2 \
+            --retry-delay 5 \
+            --connect-timeout 20 \
+            --max-time 180 \
+            --user-agent "Mozilla/5.0 GitHub-Daily-Report-Sync" \
+            --header "Cache-Control: no-cache" \
+            --output "$RUNNER_TEMP/latest-report.html" \
+            "$SOURCE_URL"
+
+          test -s "$RUNNER_TEMP/latest-report.html"
+
+      - name: 檢查內容並修正資源連結
+        shell: bash
+        run: |
+          python3 <<'PY'
+          import os
+          import re
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          source = os.environ["SOURCE_URL"]
+          path = Path(os.environ["RUNNER_TEMP"]) / "latest-report.html"
+          content = path.read_text(encoding="utf-8")
+
+          # 避免把錯誤頁、空白頁覆蓋成正式首頁
+          if not re.search(r"<html\b", content, re.I):
+              raise SystemExit("下載內容不是完整 HTML，保留原首頁。")
+
+          if "全球強震" not in content:
+              raise SystemExit("下載內容不符合預期，保留原首頁。")
+
+          # 讓一般相對路徑仍指向原站
+          content = re.sub(r"<base\b[^>]*>", "", content, flags=re.I)
+          content = re.sub(
+              r"(<head\b[^>]*>)",
+              lambda m: m.group(1) + f'\n<base href="{source}">',
+              content,
+              count=1,
+              flags=re.I,
+          )
+
+          # /site.css、/maps/... 等根目錄路徑改為原站網址
+          attribute_pattern = re.compile(
+              r"""(\b(?:href|src|poster|action)\s*=\s*["'])(/(?!/)[^"']*)""",
+              re.I,
+          )
+          content = attribute_pattern.sub(
+              lambda m: m.group(1) + urljoin(source, m.group(2)),
+              content,
+          )
+
+          # 修正響應式圖片 srcset
+          def fix_srcset(match):
+              entries = []
+              for item in match.group(2).split(","):
+                  parts = item.strip().split()
+                  if parts and parts[0].startswith("/"):
+                      parts[0] = urljoin(source, parts[0])
+                  entries.append(" ".join(parts))
+              return match.group(1) + ", ".join(entries) + match.group(3)
+
+          content = re.sub(
+              r"""(\bsrcset\s*=\s*["'])([^"']*)(["'])""",
+              fix_srcset,
+              content,
+              flags=re.I,
+          )
+
+          Path("index.html").write_text(content, encoding="utf-8")
+          print("首頁下載及內容檢查成功。")
+          PY
+
+      - name: 提交並推送更新
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add index.html
+
+          if git diff --cached --quiet; then
+            echo "首頁沒有變更，略過 commit。"
+            exit 0
+          fi
+
+          REPORT_TIME="$(TZ=Asia/Taipei date '+%Y-%m-%d %H:%M:%S')"
+
+          git commit -m "同步地震日報：${REPORT_TIME} 台北時間"
+          git push origin "HEAD:${TARGET_BRANCH}"
